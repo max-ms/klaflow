@@ -2,7 +2,9 @@
 terraform/.terraform/
 terraform/*.tfstate
 terraform/*.tfstate.backup
+terraform/*.tfstate.*.backup
 terraform/.terraform.lock.hcl
+terraform/tfplan
 
 # Python
 __pycache__/
@@ -15,6 +17,10 @@ __pycache__/
 .idea/
 .vscode/
 *.swp
+
+# Node / UI
+src/ui/node_modules/
+src/ui/dist/
 
 # OS
 .DS_Store
