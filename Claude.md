@@ -70,7 +70,8 @@ complete end-to-end.
 | ML scoring (toy)       | Python scoring service                  | decisions    |
 | Decision engine        | FastAPI bandit service                  | decisions    |
 | Observability          | Prometheus + Grafana                    | monitoring   |
-| Query API              | FastAPI                                 | api          |
+| Query API              | FastAPI (17 endpoints)                  | api          |
+| Frontend UI            | React 18 + TypeScript + Tailwind        | ui           |
 | Infrastructure         | Terraform (kubernetes + helm providers) | —            |
 | Kubernetes             | kind                                    | —            |
 
@@ -93,7 +94,8 @@ klaflow/
 │       ├── redis/                       ← Feature store
 │       ├── decisions/                   ← Bandit scoring service
 │       ├── observability/               ← Prometheus + Grafana
-│       └── api/                         ← FastAPI query layer
+│       ├── api/                         ← FastAPI query layer
+│       └── ui/                          ← React frontend (Deployment + Service)
 ├── src/
 │   ├── producer/
 │   │   ├── producer.py                  ← emits synthetic customer events
@@ -117,8 +119,17 @@ klaflow/
 │   │   ├── reward_logger.py             ← logs decisions + outcomes for retraining
 │   │   └── requirements.txt
 │   ├── api/
-│   │   ├── main.py                      ← FastAPI: query + decision endpoints
+│   │   ├── main.py                      ← FastAPI: 17 endpoints (query + decision + UI)
 │   │   └── requirements.txt
+│   ├── ui/                              ← React frontend (Vite + Tailwind + Recharts)
+│   │   ├── src/
+│   │   │   ├── api/client.ts            ← TanStack Query API client
+│   │   │   ├── components/              ← Layout, Badge, Skeleton, ErrorState
+│   │   │   └── pages/                   ← Dashboard, Profiles, CustomerProfile,
+│   │   │                                   Segments, SegmentDetail, Decisions,
+│   │   │                                   Flows (stub), Campaigns (stub)
+│   │   ├── vite.config.ts              ← dev server + /api proxy to localhost:8000
+│   │   └── package.json
 │   └── clickhouse/
 │       └── schema.sql                   ← ClickHouse table definitions
 ├── docker/
@@ -127,7 +138,10 @@ klaflow/
 │   ├── feature_store/Dockerfile
 │   ├── ml_models/Dockerfile
 │   ├── decision_engine/Dockerfile
-│   └── api/Dockerfile
+│   ├── api/Dockerfile
+│   └── ui/                              ← multi-stage: node build → nginx serve
+│       ├── Dockerfile
+│       └── nginx.conf                   ← SPA routing + /api/ proxy to API service
 ├── scripts/
 │   ├── setup.sh                         ← prerequisite check + kind cluster creation
 │   ├── deploy.sh                        ← terraform init + apply
