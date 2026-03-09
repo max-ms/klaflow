@@ -17,7 +17,8 @@ A hands-on emulation of Klaviyo's production architecture: real-time customer se
                         │  ML Scoring: CLV tier, churn risk, discount sensitivity │
                         │  Decision Engine: Thompson Sampling contextual bandit   │
                         │                                                         │
-                        │  API: 10 FastAPI endpoints over all of the above        │
+                        │  API: 17 FastAPI endpoints over all of the above        │
+                        │  UI:  React dashboard (profiles, segments, decisions)   │
                         └─────────────────────────────────────────────────────────┘
 ```
 
@@ -30,6 +31,7 @@ A hands-on emulation of Klaviyo's production architecture: real-time customer se
 - [Prerequisites](#prerequisites)
 - [Quick Start](#quick-start)
 - [Running the Pipeline](#running-the-pipeline)
+- [Frontend UI](#frontend-ui)
 - [Exploring the System](#exploring-the-system)
   - [API](#1-api--what-users-see)
   - [ClickHouse](#2-clickhouse--the-query-layer)
@@ -97,7 +99,8 @@ Sits downstream of the feature store. For a given customer:
 | Feature store        | Redis                                | `features`    |
 | ML scoring           | Python FastAPI service               | `decisions`   |
 | Decision engine      | Thompson Sampling bandit             | `decisions`   |
-| Query API            | FastAPI (10 endpoints)               | `api`         |
+| Query API            | FastAPI (17 endpoints)               | `api`         |
+| Frontend UI          | React 18 + TypeScript + Tailwind     | `ui`          |
 | Observability        | Prometheus + Grafana                 | `monitoring`  |
 | Infrastructure       | Terraform (kubernetes + helm)        | —             |
 | Kubernetes           | kind                                 | —             |
@@ -314,6 +317,83 @@ curl -s -X POST http://localhost:8000/decide \
   -H "Content-Type: application/json" \
   -d '{"customer_id":"merchant_001:cust_0001","account_id":"merchant_001"}' | python3 -m json.tool
 ```
+
+---
+
+## Frontend UI
+
+A React dashboard that connects to the live FastAPI backend. Modeled on Klaviyo's production UI — clean, data-dense, professional SaaS design.
+
+**Stack:** React 18, TypeScript, Tailwind CSS, React Router v6, TanStack Query, Recharts, Vite.
+
+### Running locally (development)
+
+```bash
+cd src/ui
+npm install
+npm run dev
+# → http://localhost:3001 (proxies /api to localhost:8000)
+```
+
+Make sure the API port-forward is active:
+
+```bash
+kubectl port-forward svc/klaflow-api 8000:80 -n api &
+```
+
+### Running on Kubernetes
+
+```bash
+# Build and load the UI image
+docker build -f docker/ui/Dockerfile -t klaflow-ui:latest .
+kind load docker-image klaflow-ui:latest --name klaflow-us
+
+# Deploy via Terraform (terraform/modules/ui/)
+cd terraform && terraform apply
+
+# Access via port-forward
+kubectl port-forward svc/klaflow-ui 3000:3000 -n ui &
+open http://localhost:3000
+```
+
+### Pages
+
+| Page | Route | Description |
+|------|-------|-------------|
+| **Dashboard** | `/dashboard` | 4 KPI cards (total profiles, active segments, events/24h, revenue/7d) + segment membership bar chart |
+| **Profiles** | `/profiles` | Paginated table (50/page), searchable by customer ID. Shows lifecycle state (color-coded badge), CLV tier, churn risk (progress bar), segment pills. Click a row to open the profile detail. |
+| **Customer Profile** | `/profiles/:id` | Left panel: customer properties, segment memberships, "Get Decision" button (calls `POST /decide` inline). Right panel with 4 tabs: Activity (counter history), Segments (in/out with evaluation timestamps), Decisions (history with reward outcomes), Features (full Redis feature vector with plain-English labels). |
+| **Segments** | `/segments` | List with member counts, % of total, and human-readable condition summaries. Click through to segment detail. |
+| **Segment Detail** | `/segments/:name` | Condition definition, member count, percentage, and paginated member table with links to customer profiles. |
+| **Decisions** | `/decisions` | Bandit operator view: arm performance table (alpha/beta/expected Thompson), arm distribution pie chart, live decision feed (auto-refreshes every 15s). |
+| **Flows** | `/flows` | Stub — placeholder cards for Welcome Series, Abandoned Cart, Win-Back flows. Phase 2 banner. |
+| **Campaigns** | `/campaigns` | Stub — Phase 2 banner. |
+
+### Design
+
+- **Sidebar:** Deep navy (`#1B2559`) with white text, persistent navigation
+- **Accent:** Klaviyo green (`#27AE60`)
+- **Font:** Inter (Google Fonts)
+- **Tables:** Zebra striping, hover highlight, sticky headers
+- **Loading:** Skeleton screens (shimmer animation), not spinners
+- **Empty states:** Descriptive message, not blank
+- **Errors:** Inline error with retry button
+- **Transitions:** 150ms ease
+
+### API endpoints added for the UI
+
+These endpoints were added to `src/api/main.py` alongside the original 10:
+
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/dashboard/stats` | GET | KPI aggregates: total profiles, active segments, events in last 24h, revenue |
+| `/customers` | GET | Paginated customer list with feature data from Redis. Query params: `page`, `page_size`, `search` |
+| `/customers/{id}/events` | GET | Counter history for a customer from ClickHouse (paginated) |
+| `/customers/{id}/all-segments` | GET | All segment evaluations (both in-segment and not-in-segment) |
+| `/segments/{name}/detail` | GET | Segment metadata: member count, percentage, condition definition |
+| `/decisions/recent` | GET | Recent decisions across all customers for the live feed |
+
+CORS middleware is enabled for frontend development (`allow_origins=["*"]`).
 
 ---
 
@@ -550,7 +630,7 @@ Module dependency graph:
 kafka (streaming)
 clickhouse (analytics)        ──► decisions (depends on clickhouse + redis)
 redis (features)              ──► api (depends on clickhouse + redis)
-flink (processing)
+flink (processing)                  ──► ui (standalone, proxies to api)
 observability (monitoring)
 ```
 
@@ -647,7 +727,8 @@ klaflow/
 │       ├── redis/                           # Redis standalone
 │       ├── observability/                   # Prometheus + Grafana
 │       ├── decisions/                       # ML scoring + reward logger
-│       └── api/                             # FastAPI deployment
+│       ├── api/                             # FastAPI deployment
+│       └── ui/                              # React frontend (Deployment + Service)
 ├── src/
 │   ├── producer/
 │   │   ├── producer.py                      # Synthetic events: seed (90 days) or continuous
@@ -668,7 +749,18 @@ klaflow/
 │   │   ├── arms.py                          # 5 arms + reward constants
 │   │   └── reward_logger.py                 # Background reward closure job
 │   ├── api/
-│   │   └── main.py                          # 10 FastAPI endpoints
+│   │   └── main.py                          # 17 FastAPI endpoints (10 original + 7 UI)
+│   ├── ui/                                  # React frontend
+│   │   ├── src/
+│   │   │   ├── api/client.ts                # TanStack Query API client
+│   │   │   ├── components/                  # Layout, Badge, Skeleton, ErrorState
+│   │   │   └── pages/                       # Dashboard, Profiles, CustomerProfile,
+│   │   │                                    #   Segments, SegmentDetail, Decisions,
+│   │   │                                    #   Flows, Campaigns
+│   │   ├── index.html
+│   │   ├── vite.config.ts                   # Dev server + API proxy
+│   │   ├── tailwind.config.js
+│   │   └── package.json
 │   └── clickhouse/
 │       └── schema.sql                       # 5 table definitions
 ├── docker/                                  # Dockerfiles for each service
@@ -708,6 +800,8 @@ Tests mock external dependencies (Kafka, ClickHouse, Redis, PyFlink) and validat
      applies Thompson Sampling, logs decision to ClickHouse
 8. Reward closure job checks outcomes (purchases within 72h), writes to reward_log
 9. API serves queries over all of the above — segments, features, decisions, metrics
+10. React UI connects to the API and presents dashboards, profile views,
+      segment management, and a bandit operator console
 ```
 
 The key ordering dependency: **feature writer must run before segment evaluation** for ML-dependent
