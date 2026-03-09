@@ -1,0 +1,72 @@
+{
+  "type": "record",
+  "name": "CustomerEvent",
+  "namespace": "com.klaflow.events",
+  "fields": [
+    {
+      "name": "event_id",
+      "type": "string"
+    },
+    {
+      "name": "customer_id",
+      "type": "string"
+    },
+    {
+      "name": "account_id",
+      "type": "string"
+    },
+    {
+      "name": "event_type",
+      "type": {
+        "type": "enum",
+        "name": "EventType",
+        "symbols": [
+          "email_opened",
+          "link_clicked",
+          "purchase_made",
+          "page_viewed",
+          "cart_abandoned"
+        ]
+      }
+    },
+    {
+      "name": "timestamp",
+      "type": "long",
+      "logicalType": "timestamp-millis"
+    },
+    {
+      "name": "properties",
+      "type": {
+        "type": "record",
+        "name": "EventProperties",
+        "fields": [
+          {
+            "name": "campaign_id",
+            "type": ["null", "string"],
+            "default": null
+          },
+          {
+            "name": "product_id",
+            "type": ["null", "string"],
+            "default": null
+          },
+          {
+            "name": "product_category",
+            "type": ["null", "string"],
+            "default": null
+          },
+          {
+            "name": "amount",
+            "type": ["null", "double"],
+            "default": null
+          },
+          {
+            "name": "email_subject",
+            "type": ["null", "string"],
+            "default": null
+          }
+        ]
+      }
+    }
+  ]
+}
