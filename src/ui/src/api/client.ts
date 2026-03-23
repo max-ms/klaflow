@@ -119,3 +119,38 @@ export const fetchAccountMetrics = (id: string) =>
   request<{ metric_name: string; metric_value: string; computed_at: string }[]>(
     `/accounts/${id}/metrics`,
   )
+
+// Agent campaigns
+export interface CampaignSummary {
+  campaign_id: string
+  account_id: string
+  goal: string
+  status: string
+  targeted_count: number
+  scheduled_count: number
+  excluded_count: number
+  arm_breakdown: Record<string, number>
+  tool_call_count: number
+  tool_call_log: { tool: string; args: Record<string, unknown>; duration_ms: number }[]
+  report: string | null
+  error: string | null
+  created_at: number
+  parsed_intent?: {
+    objective: string
+    target_segments: string[]
+    exclusion_days: number | null
+    summary: string
+  }
+}
+
+export const createCampaign = (account_id: string, goal: string) =>
+  request<CampaignSummary>('/agent/campaign', {
+    method: 'POST',
+    body: JSON.stringify({ account_id, goal }),
+  })
+
+export const fetchCampaign = (id: string) =>
+  request<CampaignSummary>(`/agent/campaign/${id}`)
+
+export const fetchCampaigns = (account_id = '') =>
+  request<CampaignSummary[]>(`/agent/campaigns${account_id ? `?account_id=${account_id}` : ''}`)

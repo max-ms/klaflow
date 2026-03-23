@@ -2,7 +2,7 @@
 DROP TABLE IF EXISTS customer_events;
 DROP TABLE IF EXISTS customer_segments;
 
--- Aggregated customer counters (written by Flink Job 1 / batch aggregation)
+-- Aggregated customer counters (written by Flink Job 1: customer aggregation)
 CREATE TABLE IF NOT EXISTS customer_counters (
     account_id       String,
     customer_id      String,
@@ -23,7 +23,7 @@ CREATE TABLE IF NOT EXISTS segment_membership (
 ) ENGINE = ReplacingMergeTree(evaluated_at)
   ORDER BY (account_id, customer_id, segment_name);
 
--- Account-level metrics (written by Flink Job 2 / batch aggregation)
+-- Account-level metrics (written by Flink Job 2: account aggregation)
 CREATE TABLE IF NOT EXISTS account_metrics (
     account_id       String,
     metric_name      String,

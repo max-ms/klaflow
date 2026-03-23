@@ -16,6 +16,10 @@ resource "kubernetes_secret" "clickhouse_credentials" {
     CLICKHOUSE_USER     = "klaflow"
     CLICKHOUSE_PASSWORD = "klaflow-pass"
     CLICKHOUSE_DB       = "default"
+    REDIS_HOST          = "redis-master.features.svc.cluster.local"
+    REDIS_PORT          = "6379"
+    KLAFLOW_API_URL     = "http://localhost:8000"
+    ANTHROPIC_API_KEY   = var.anthropic_api_key
   }
 }
 

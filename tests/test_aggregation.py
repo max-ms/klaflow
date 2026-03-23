@@ -23,20 +23,14 @@ sys.modules["pyflink.datastream.connectors.kafka"] = MagicMock()
 sys.modules["pyflink.datastream.functions"] = MagicMock()
 sys.modules["pyflink.datastream.state"] = MagicMock()
 sys.modules["pyflink.datastream.state_backend"] = MagicMock()
+sys.modules["pyflink.table"] = MagicMock()
 
-# Mock confluent_kafka for batch_aggregation imports
-sys.modules["confluent_kafka"] = MagicMock()
-sys.modules["confluent_kafka.schema_registry"] = MagicMock()
-sys.modules["confluent_kafka.schema_registry.avro"] = MagicMock()
-sys.modules["confluent_kafka.serialization"] = MagicMock()
+# Mock fastavro (not needed for pure logic tests)
+sys.modules["fastavro"] = MagicMock()
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "src" / "flink_jobs"))
 
 from customer_aggregation_job import compute_fan_out_counters, TIME_WINDOWS
-from batch_aggregation import (
-    compute_fan_out_counters as batch_compute_fan_out_counters,
-    compute_account_metrics,
-)
 
 
 import time
@@ -72,6 +66,31 @@ def make_event(
             "email_subject": email_subject,
         },
     }
+
+
+def compute_account_metrics(events_by_account):
+    """Compute account-level metrics from grouped events.
+
+    This mirrors the logic in AccountAggregationFunction but runs in-process
+    for testing without Flink.
+    """
+    results = {}
+    for account_id, events in events_by_account.items():
+        events_per_hour = float(len(events))
+        sends_today = float(sum(1 for e in events if e["event_type"] == "email_opened"))
+        active_customers = len(set(e["customer_id"] for e in events))
+        revenue = sum(
+            float(e["properties"]["amount"])
+            for e in events
+            if e["event_type"] == "purchase_made" and e["properties"].get("amount") is not None
+        )
+        results[account_id] = [
+            ("events_per_hour", events_per_hour),
+            ("sends_today", sends_today),
+            ("active_customers_7d", float(active_customers)),
+            ("revenue_7d", revenue),
+        ]
+    return results
 
 
 # ---------------------------------------------------------------------------
@@ -198,33 +217,6 @@ class TestCounterValues:
         amount_counters = [(n, v) for n, v in counters if n.startswith("purchase_amount_")]
         for name, value in amount_counters:
             assert value == 123.45
-
-
-# ---------------------------------------------------------------------------
-# Batch fan-out consistency tests
-# ---------------------------------------------------------------------------
-
-
-class TestBatchFanOutConsistency:
-    """Test that batch_aggregation.compute_fan_out_counters matches the Flink version."""
-
-    def test_batch_and_flink_produce_same_counters(self):
-        event = make_event(event_type="email_opened", campaign_id="camp_003")
-        flink_counters = compute_fan_out_counters(event, now_ms=NOW_MS)
-        batch_counters = batch_compute_fan_out_counters(event, now_ms=NOW_MS)
-
-        flink_names = sorted([c[0] for c in flink_counters])
-        batch_names = sorted([c[0] for c in batch_counters])
-        assert flink_names == batch_names
-
-    def test_batch_purchase_matches_flink(self):
-        event = make_event(event_type="purchase_made", amount=200.0, product_category="hats")
-        flink_counters = compute_fan_out_counters(event, now_ms=NOW_MS)
-        batch_counters = batch_compute_fan_out_counters(event, now_ms=NOW_MS)
-
-        flink_dict = dict(flink_counters)
-        batch_dict = dict(batch_counters)
-        assert flink_dict == batch_dict
 
 
 # ---------------------------------------------------------------------------

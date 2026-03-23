@@ -7,10 +7,16 @@ built to understand how a real-time segmentation and per-customer decisioning
 platform works at scale. It emulates the specific architectural choices Klaviyo
 made — not a generic event pipeline.
 
-Built in two phases:
+Built in four phases, in this order:
 
-- **Phase 1**: Single-region pipeline — Klaviyo's core event → segment → decision loop
-- **Phase 2**: Multi-region split — data residency, async replication, segment divergence
+- **Phase 1**: Single-region pipeline — Klaviyo's core event → segment → decision loop ✓ complete
+- **Phase 2a**: AI marketing agent — LLM + tool calls over the existing pipeline
+- **Phase 2b**: Ontology layer — typed knowledge graph (Neo4j) powering agent reasoning
+- **Phase 3**: Multi-region split — data residency, async replication, segment divergence
+
+Phase 3 is last intentionally. Phases 2a and 2b build directly on Phase 1 with
+no new infrastructure requirements and are more relevant to the AI agent and
+ontology learning goals. Phase 3 is operationally heavy and saved for last.
 
 ---
 
@@ -72,6 +78,8 @@ complete end-to-end.
 | Observability          | Prometheus + Grafana                    | monitoring   |
 | Query API              | FastAPI (17 endpoints)                  | api          |
 | Frontend UI            | React 18 + TypeScript + Tailwind        | ui           |
+| AI marketing agent     | Python + Anthropic API (tool_use)       | agent        |
+| Knowledge graph        | Neo4j Community Edition                 | ontology     |
 | Infrastructure         | Terraform (kubernetes + helm providers) | —            |
 | Kubernetes             | kind                                    | —            |
 
@@ -95,7 +103,9 @@ klaflow/
 │       ├── decisions/                   ← Bandit scoring service
 │       ├── observability/               ← Prometheus + Grafana
 │       ├── api/                         ← FastAPI query layer
-│       └── ui/                          ← React frontend (Deployment + Service)
+│       ├── ui/                          ← React frontend (Deployment + Service)
+│       ├── agent/                       ← AI marketing agent service (Phase 2a)
+│       └── neo4j/                       ← Neo4j Community Edition (Phase 2b)
 ├── src/
 │   ├── producer/
 │   │   ├── producer.py                  ← emits synthetic customer events
@@ -132,6 +142,20 @@ klaflow/
 │   │   └── package.json
 │   └── clickhouse/
 │       └── schema.sql                   ← ClickHouse table definitions
+│   ├── agent/                           ← Phase 2a: AI marketing agent
+│   │   ├── agent.py                     ← LLM orchestration loop
+│   │   ├── tools.py                     ← tool wrappers over FastAPI ✓ done
+│   │   ├── tool_schemas.py              ← JSON schemas for Anthropic tool_use API
+│   │   ├── goal_parser.py               ← structured intent from natural language
+│   │   ├── campaign_monitor.py          ← outcome monitoring + report generation
+│   │   └── requirements.txt             ← anthropic package ✓ done
+│   └── ontology/                        ← Phase 2b: knowledge graph layer
+│       ├── schema.py                    ← object type and link type definitions
+│       ├── graph_writer.py              ← populates Neo4j from ClickHouse + Redis
+│       ├── graph_query.py               ← Cypher execution + result hydration
+│       ├── nl_to_cypher.py              ← LLM translates NL → Cypher (logged)
+│       ├── graphrag.py                  ← hybrid vector + graph retrieval
+│       └── requirements.txt
 ├── docker/
 │   ├── producer/Dockerfile
 │   ├── flink_jobs/Dockerfile
@@ -528,9 +552,9 @@ After each step:
 
 ---
 
-## Phase 2: Multi-region (do not start until Phase 1 is fully working)
+## Phase 3: Multi-region (do not start until Phases 1, 2a, and 2b are complete)
 
-Phase 2 splits into two kind clusters to emulate multi-region deployment.
+Phase 3 splits into two kind clusters to emulate multi-region deployment.
 
 ### Clusters
 - `klaflow-us` — us-east-1 simulation
@@ -540,7 +564,7 @@ Phase 2 splits into two kind clusters to emulate multi-region deployment.
 
 **Kafka MirrorMaker 2**
 Replicates `customer-events` topic between clusters asynchronously.
-This is the source of the core Phase 2 problem: replication lag.
+This is the source of the core Phase 3 problem: replication lag.
 
 **Global event router**
 Routes incoming events by `account_id` hash to the owning region.
@@ -548,7 +572,7 @@ Each account has a home region. Events for that account normally go to the
 home cluster; routing to the non-home cluster creates a cross-region write
 that must be replicated.
 
-**The core Phase 2 problem to demonstrate:**
+**The core Phase 3 problem to demonstrate:**
 Due to async replication lag (MirrorMaker has non-zero latency), the same
 customer can appear in different segments depending on which cluster you query.
 Example: customer makes a purchase, event arrives in US cluster, Flink updates
@@ -584,7 +608,7 @@ GET /divergence/report → show customers whose segment membership
 For the POC, implement option 1 (read-your-writes) as the pragmatic solution
 and demonstrate that it resolves the most common divergence case.
 
-### Phase 2 repo additions
+### Phase 3 repo additions
 
 ```
 terraform/
@@ -607,7 +631,7 @@ src/
     └── requirements.txt
 ```
 
-### Phase 2 build order
+### Phase 3 build order
 
 1. Provision `klaflow-eu` kind cluster
 2. Terraform envs split — same modules applied to both clusters
@@ -676,6 +700,345 @@ makes the segmentation and decision outputs more interesting to observe.
 - Do not query ClickHouse from the decision engine at decision time — use Redis
 - Do not skip Schema Registry validation in the producer
 - Do not make the bandit dynamically define new arms at runtime
-- Do not start Phase 2 until Phase 1 is fully working end-to-end
+- Do not start Phase 3 until Phases 1, 2a, and 2b are complete
 - Do not over-engineer the ML models — they are toy implementations for
   architectural demonstration, not production ML
+---
+
+## Demonstration script (CEO conversation target)
+
+The end goal of Phase 2a is a single runnable script that produces a
+concrete, side-by-side comparison suitable for showing in a technical
+conversation. This is a first-class deliverable, not an afterthought.
+
+**File:** `scripts/demo.sh` (or `src/demo/run_demo.py`)
+
+**What it does, in order:**
+
+1. Seed merchant_001 with 90 days of synthetic data (if not already seeded)
+2. Run segment evaluation — confirm at_risk segment is populated
+3. Run feature store update — confirm Redis feature vectors are fresh
+
+4. **Approach A — uniform treatment (current Klaviyo behavior):**
+   Take all customers in at_risk segment for merchant_001.
+   Send everyone the same arm: `email_10pct_discount`.
+   Log these as "approach_a" decisions in a separate comparison table.
+   Simulate outcomes: apply reward signal based on each customer's
+   discount_sensitivity score (high sensitivity → higher purchase probability).
+   Compute: conversion rate, total discount cost (count of discounts sent),
+   revenue per customer contacted.
+
+5. **Approach B — per-customer bandit (Klaflow):**
+   Same at_risk customers, same merchant.
+   Run each through the bandit — arm selected based on full feature vector.
+   Log as "approach_b" decisions.
+   Simulate outcomes using the same reward model.
+   Compute: conversion rate, total discount cost, revenue per customer contacted.
+
+6. **Print comparison report:**
+```
+═══════════════════════════════════════════════════════
+  KLAFLOW DEMO — Per-Customer Decisioning vs. Uniform Treatment
+  Merchant: merchant_001  |  Segment: at_risk  |  Customers: N
+═══════════════════════════════════════════════════════
+
+  APPROACH A — Uniform (everyone gets 10% discount)
+  ─────────────────────────────────────────────────
+  Customers targeted:     1,247
+  Discounts sent:         1,247   (100%)
+  Conversions:              87    (6.9%)
+  Unnecessary discounts:   891    (VIP + low-sensitivity customers)
+  Revenue attributed:    $4,350
+  Discount cost:         $1,247   (assumed $1/discount for illustration)
+
+  APPROACH B — Per-Customer Bandit (Klaflow)
+  ─────────────────────────────────────────────────
+  Customers targeted:     1,247
+  Arm breakdown:
+    email_no_offer         312   (25%)  — VIP, low discount sensitivity
+    email_10pct_discount   389   (31%)  — high discount sensitivity
+    email_free_shipping    201   (16%)  — mid-tier, price aware
+    sms_nudge              198   (16%)  — low email open rate
+    no_send                147   (12%)  — very low intent signals
+  Conversions:             119   (9.6%)
+  Discount cost:           $590  (47% reduction)
+  Revenue attributed:    $5,950
+
+  DELTA
+  ─────────────────────────────────────────────────
+  Conversion rate:    +2.7pp   (+39%)
+  Discount cost:      -$657    (-53%)
+  Revenue:            +$1,600  (+37%)
+═══════════════════════════════════════════════════════
+```
+
+7. Also output the arm distribution as a bar chart to a PNG file
+   (`demo_output/arm_distribution.png`) using matplotlib — simple,
+   no dependencies beyond what's already in the project.
+
+**This script must be runnable in under 5 minutes on a fresh seed.**
+It is the single most important thing to have working before a CEO conversation.
+The numbers don't need to be perfectly calibrated — the point is demonstrating
+that per-customer treatment produces a measurably different (and better) outcome
+than uniform treatment, and that the system can show you why (arm breakdown).
+
+---
+
+## Phase 2 agent additions
+(append to existing Phase 2 section when built)
+
+Phase 2a adds one more demo capability on top of the comparison script:
+
+**Agent demo extension:**
+After the comparison report, show the agent accepting a natural language goal
+and producing the Approach B execution plan automatically:
+
+```
+INPUT:  "Re-engage at-risk customers for merchant_001.
+         Don't discount VIP customers. Skip anyone contacted this week."
+
+AGENT TOOL CALL SEQUENCE:
+  1. get_segments() → found: at_risk (1,247 customers)
+  2. check_recent_contact(days=7) → excluded 89 customers
+  3. get_customer_features() × 1,158 → feature vectors retrieved
+  4. request_decision() × 1,158 → bandit arms selected
+  5. schedule_action() × 1,011 → actions scheduled (147 no_send excluded)
+
+OUTPUT: Campaign #c_001 created. 1,011 actions scheduled.
+        Monitoring for outcomes over next 72 hours.
+```
+
+This sequence printed to console is the "show your work" moment —
+it makes the agent's reasoning visible and auditable without needing
+a polished UI.
+
+---
+
+## Phase 2: AI Marketing Agent (do not start until Phase 1 is fully working)
+
+Phase 2 adds an AI marketing agent layer on top of the existing pipeline.
+Nothing in Phase 1 is replaced. The agent layer sits above it.
+
+Phase 2 is split into two sub-phases:
+
+- **Phase 2a**: Agent without ontology — LLM + tool calls over existing APIs
+- **Phase 2b**: Ontology layer — typed knowledge graph powering agent reasoning
+
+Build 2a first. The contrast between 2a and 2b is the learning.
+
+---
+
+### What the agent actually does
+
+A merchant expresses a goal in natural language:
+> "Re-engage customers who haven't purchased in 60 days but were previously
+> high-value. Don't send to anyone who got a message in the last 7 days."
+
+The agent:
+1. Parses the goal into structured intent
+2. Queries the existing API to find qualifying customers
+3. Applies exclusion rules automatically
+4. Selects appropriate action per customer via the existing bandit
+5. Schedules execution
+6. Monitors outcomes and generates a report
+
+The agent does NOT replace the bandit. It decides whether and when to engage.
+The bandit decides which action to take. Different decisions, different levels.
+
+---
+
+### Phase 2a: Agent without ontology
+
+**Tool set:**
+
+```python
+get_segments()
+get_segment_members(segment_name, limit)
+get_customer_segments(customer_id)
+get_customer_features(customer_id)
+get_customer_decision_history(customer_id)
+check_recent_contact(customer_id, days)
+get_suppression_list(account_id)
+request_decision(customer_id, context)
+schedule_action(customer_id, arm, send_at)
+get_campaign_outcomes(campaign_id, hours_elapsed)
+get_arm_performance(arm_name, days)
+```
+
+**What the LLM does vs. tools:**
+- LLM: intent parsing, tool sequence decisions, report generation
+- Tools: all data access, all writes, all arithmetic
+
+**New files:**
+```
+src/agent/
+  agent.py              ← LLM orchestration loop
+  tools.py              ← FastAPI wrappers ✓ done
+  tool_schemas.py       ← Anthropic tool_use JSON schemas
+  goal_parser.py        ← NL → structured intent
+  campaign_monitor.py   ← outcome monitoring + report
+  requirements.txt      ← anthropic package ✓ done
+
+src/api/agent_endpoints.py   ← /agent/* routes added to FastAPI
+terraform/modules/agent/
+docker/agent/Dockerfile
+```
+
+**New API endpoints:**
+```
+POST /agent/campaign        → { campaign_id, status }
+GET  /agent/campaign/{id}   → { plan, targeted_count, sent_count, outcomes, report }
+GET  /agent/campaigns       → list all campaigns
+POST /agent/campaign/{id}/pause
+POST /agent/campaign/{id}/cancel
+```
+
+**LLM:** claude-sonnet-4-20250514 via Anthropic API tool_use. No frameworks.
+
+**Smoke test:**
+```
+POST /agent/campaign
+{
+  "account_id": "merchant_001",
+  "goal": "Send a win-back offer to customers who haven't purchased
+           in 45 days. Skip anyone contacted in the last 14 days."
+}
+```
+Expected tool call sequence in logs:
+get_segments → get_segment_members → check_recent_contact ×N →
+get_customer_features ×N → request_decision ×N → schedule_action ×N
+
+**UI:** Wire the Campaigns page (currently stub) to /agent/* endpoints.
+Show: goal text, status, tool call log, arm breakdown, conversion rate.
+
+---
+
+### Phase 2b: Ontology layer
+
+**Why 2a falls short:**
+
+The LLM in 2a reasons over flat API responses. It cannot answer multi-hop
+questions:
+- "Which customers received a win-back last month, purchased, then lapsed again?"
+- "What products do at-risk VIP customers browse before churning?"
+- "Which campaigns worked for this segment before?"
+
+These require graph traversal. Neo4j provides it.
+
+**Object types:**
+```
+Profile     customer_id, account_id, lifecycle_state, clv_tier
+Order       order_id, customer_id, amount, timestamp
+Product     product_id, name, category, price
+Segment     name, condition_definition, member_count
+Campaign    campaign_id, goal_text, status, targeted_count
+Decision    decision_id, customer_id, arm, score, timestamp
+Outcome     outcome_id, decision_id, reward, observed_at
+```
+
+**Link types:**
+```
+Profile  —[PLACED]→       Order
+Profile  —[BROWSED]→      Product
+Profile  —[MEMBER_OF]→    Segment
+Profile  —[RECEIVED]→     Decision
+Decision —[RESULTED_IN]→  Outcome
+Campaign —[TARGETED]→     Profile
+Campaign —[USED_SEGMENT]→ Segment
+Order    —[CONTAINS]→     Product
+```
+
+**Two new agent tools:**
+```python
+graph_query(cypher_query)        # run Cypher, return typed objects
+explain_query(natural_language)  # NL → Cypher → run → return results + query
+```
+
+**The contrast that matters:**
+
+Goal: "Re-engage VIP customers who bought electronics in Q4 but haven't purchased since."
+
+Phase 2a: calls get_segments(), finds vip_lapsed, returns all of them.
+Misses the electronics filter, Q4 timing, customers who bought in January.
+
+Phase 2b generates and runs:
+```cypher
+MATCH (p:Profile)-[:PLACED]->(o:Order)-[:CONTAINS]->(prod:Product)
+WHERE p.clv_tier = 'vip'
+  AND prod.category = 'electronics'
+  AND o.timestamp >= datetime('2024-10-01')
+  AND o.timestamp <  datetime('2025-01-01')
+  AND NOT EXISTS {
+    MATCH (p)-[:PLACED]->(o2:Order)
+    WHERE o2.timestamp >= datetime('2025-01-01')
+  }
+RETURN p.customer_id, max(o.timestamp) as last_purchase
+ORDER BY last_purchase DESC
+```
+
+The Cypher is the reasoning made explicit — auditable, readable, correctable.
+
+**New files:**
+```
+src/ontology/
+  schema.py         ← object + link type definitions
+  graph_writer.py   ← populates Neo4j from ClickHouse + Redis (15min poll)
+  graph_query.py    ← Cypher execution + result hydration
+  nl_to_cypher.py   ← LLM → Cypher with query_log audit trail
+  graphrag.py       ← vector similarity over past campaigns + graph traversal
+  requirements.txt
+
+terraform/modules/neo4j/
+docker/neo4j/Dockerfile
+```
+
+---
+
+### Phase 2 build order
+
+**Phase 2a:**
+1. `requirements.txt` — anthropic package
+2. `tools.py` — FastAPI wrappers
+3. `tool_schemas.py` — Anthropic tool_use JSON schemas
+4. `agent.py` — LLM loop
+   → Smoke test: tool call sequence appears in logs for test goal
+5. `campaign_monitor.py` — reward polling + report generation
+6. `/agent/*` FastAPI endpoints
+7. Dockerfile + Terraform module
+8. Wire Campaigns UI page to /agent/* endpoints
+9. **`scripts/demo.py` — side-by-side comparison script** (see Demonstration script section)
+   → This is the most important deliverable for the CEO conversation
+
+**Phase 2b:**
+10. Neo4j — Terraform module
+    → Smoke test: Cypher query runs
+11. `schema.py` — object and link type definitions
+12. `graph_writer.py` — populate nodes from ClickHouse + Redis
+    → Smoke test: MATCH (p:Profile) RETURN count(p) matches customer count
+13. Link population — PLACED, BROWSED, MEMBER_OF, RECEIVED
+    → Smoke test: multi-hop query returns results
+14. `nl_to_cypher.py` — NL → Cypher with logging
+    → Smoke test: natural language → valid Cypher → non-empty results
+15. Add graph_query + explain_query tools to agent
+16. `graphrag.py` — vector similarity + graph traversal
+    → Smoke test: complex goal produces more precise cohort than Phase 2a
+
+---
+
+### Hard constraints for Phase 2
+
+- **No LangChain or agent frameworks** — Anthropic API tool_use directly
+- **LLM never touches raw data** — all data access through tool functions
+- **Cypher queries are logged** — every nl_to_cypher translation stored in query_log
+- **Neo4j is reasoning layer only** — no event-level data, graph structure only
+- **Do not modify existing Phase 1 code** — agent calls the API, not internals
+- **Arms remain pre-defined** — agent requests bandit decisions, cannot create arms
+- **Do not start Phase 2b until Phase 2a smoke tests pass**
+
+### What NOT to do in Phase 2
+
+- Do not use LangChain, LlamaIndex, or any agent framework
+- Do not let the LLM generate SQL or ClickHouse queries
+- Do not store event-level data in Neo4j
+- Do not replace the bandit with the agent
+- Do not modify existing endpoints in src/api/main.py — add agent_endpoints.py separately

@@ -15,3 +15,10 @@ variable "kubeconfig_context" {
   type        = string
   default     = "kind-klaflow-us"
 }
+
+variable "anthropic_api_key" {
+  description = "Anthropic API key for the AI agent"
+  type        = string
+  default     = ""
+  sensitive   = true
+}

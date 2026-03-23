@@ -1,6 +1,6 @@
 # Klaflow
 
-A hands-on emulation of Klaviyo's production architecture: real-time customer segmentation, per-customer feature vectors, and a contextual bandit decision engine. Runs entirely on local Kubernetes (kind), managed by Terraform.
+A hands-on emulation of Klaviyo's production architecture: real-time customer segmentation, per-customer feature vectors, a contextual bandit decision engine, and an AI marketing agent that orchestrates campaigns via natural language.
 
 ```
                         ┌─────────────────────────────────────────────────────────┐
@@ -17,8 +17,10 @@ A hands-on emulation of Klaviyo's production architecture: real-time customer se
                         │  ML Scoring: CLV tier, churn risk, discount sensitivity │
                         │  Decision Engine: Thompson Sampling contextual bandit   │
                         │                                                         │
-                        │  API: 17 FastAPI endpoints over all of the above        │
-                        │  UI:  React dashboard (profiles, segments, decisions)   │
+                        │  AI Agent: NL goal ──► tool calls ──► bandit ──► actions│
+                        │                                                         │
+                        │  API: 22 FastAPI endpoints over all of the above        │
+                        │  UI:  React dashboard (profiles, segments, campaigns)   │
                         └─────────────────────────────────────────────────────────┘
 ```
 
@@ -27,19 +29,18 @@ A hands-on emulation of Klaviyo's production architecture: real-time customer se
 ## Table of Contents
 
 - [Architecture](#architecture)
+  - [Track 1 — Event Aggregation](#track-1--event-aggregation)
+  - [Track 2 — Segment Evaluation](#track-2--segment-evaluation-sip-pattern)
+  - [Decision Layer](#decision-layer)
+  - [AI Agent Layer (Phase 2a)](#ai-agent-layer-phase-2a)
+- [Why Each Architectural Choice](#why-each-architectural-choice)
 - [Stack](#stack)
-- [Prerequisites](#prerequisites)
 - [Quick Start](#quick-start)
-- [Running the Pipeline](#running-the-pipeline)
+- [Running the Demo](#running-the-demo)
+- [AI Agent](#ai-agent)
 - [Frontend UI](#frontend-ui)
-- [Exploring the System](#exploring-the-system)
-  - [API](#1-api--what-users-see)
-  - [ClickHouse](#2-clickhouse--the-query-layer)
-  - [Kafka](#3-kafka--event-bus)
-  - [Redis](#4-redis--feature-store)
-  - [Prometheus + Grafana](#5-prometheus--grafana)
-  - [Terraform](#6-terraform--infrastructure)
 - [Data Model](#data-model)
+- [Inspecting Internals](#inspecting-internals)
 - [Repo Structure](#repo-structure)
 - [Running Tests](#running-tests)
 
@@ -47,7 +48,7 @@ A hands-on emulation of Klaviyo's production architecture: real-time customer se
 
 ## Architecture
 
-Klaflow has **two parallel processing tracks** and a **decision layer** that sits downstream:
+Klaflow has **two parallel processing tracks**, a **decision layer**, and an **AI agent layer** that orchestrates campaigns using the decision layer.
 
 ### Track 1 — Event Aggregation
 
@@ -83,6 +84,70 @@ Sits downstream of the feature store. For a given customer:
 3. Apply Thompson Sampling to balance exploration vs. exploitation
 4. Log the decision; a background job closes the reward loop
 
+### AI Agent Layer (Phase 2a)
+
+Sits above the decision layer. Does NOT replace the bandit — it operates at a different level of abstraction:
+
+- **Agent decides**: *whether* and *when* to engage a customer (targeting, exclusions, timing)
+- **Bandit decides**: *which action* to take once engagement is triggered (arm selection)
+
+A merchant expresses a goal in natural language:
+
+> "Send a win-back offer to at-risk customers. Skip anyone contacted in the last 14 days."
+
+The agent:
+1. Parses intent (target segment, exclusion rules, objective)
+2. Queries segments and customer data via tool calls
+3. Applies suppression list and frequency caps
+4. Calls the bandit for per-customer arm selection
+5. Schedules actions and generates a campaign report
+
+The LLM never touches raw data directly — all data access goes through 11 tool functions that call the existing API. The tool call sequence is logged and visible in the UI.
+
+**Implementation**: Direct Anthropic API `tool_use` — no LangChain or agent frameworks. The tool loop is ~100 lines of explicit Python in `agent.py`.
+
+---
+
+## Why Each Architectural Choice
+
+These are the specific decisions worth understanding — not just *what* is built, but *why* this way and not the obvious alternative.
+
+### Why two separate Flink jobs instead of one?
+
+Customer aggregation and account aggregation run on different keys (`customer_id` vs. `account_id`). Combining them means a single large merchant generating an event spike degrades counter accuracy for all customers across all merchants. Separate jobs = separate resource pools = separate failure domains. Klaviyo made this split explicitly after experiencing cross-contamination issues.
+
+### Why ClickHouse receives aggregated counters, not raw events?
+
+A naive architecture would stream raw events to ClickHouse and aggregate at query time. This fails at Klaviyo's scale: 100K events/second x 50+ dimension combinations = millions of writes per second. Instead, Flink pre-aggregates and writes the results. ClickHouse is the **query layer**, not the **aggregation layer**. This is the single most important architectural distinction.
+
+### Why Redis AND ClickHouse (not just one)?
+
+ClickHouse is optimized for analytical queries across many rows. The decision engine needs to read one customer's feature vector in <1ms. ClickHouse can't do that — even a fast point query takes 5-50ms. Redis gives <1ms hash reads. So: ClickHouse for segment evaluation (scan millions of rows), Redis for decision-time lookups (one customer, one hash).
+
+### Why the feature writer writes BACK to ClickHouse?
+
+The feature writer computes derived features (open rates, lifecycle state) and ML scores (CLV tier, churn risk). These are written to Redis for the bandit. But they're ALSO written back to `customer_counters` in ClickHouse — because segment conditions like `vip_lapsed` need `clv_tier`, and `at_risk` needs `days_since_last_purchase`. Without this write-back, ML-dependent segments would have zero members.
+
+### Why Thompson Sampling and not epsilon-greedy?
+
+Epsilon-greedy explores uniformly — it sends random actions e% of the time. Thompson Sampling explores *intelligently* — it explores more where uncertainty is highest. For a marketing system, this matters: you don't want to randomly send SMS to a customer who always opens email. Thompson Sampling concentrates exploration on arms the system hasn't learned enough about yet.
+
+### Why pre-defined arms and not dynamic ones?
+
+The action space is static: 5 arms. The bandit does NOT generate new actions. This is deliberate: dynamic arm generation creates a combinatorial explosion that makes learning intractable. Each new arm needs its own exploration budget. Keeping arms fixed means the bandit can converge on a good policy with finite data.
+
+### Why the SIP two-phase scan-then-evaluate pattern?
+
+Evaluating all 18,500 customers against all 7 segments on every cycle is wasteful — most customers haven't changed. Phase 1 scans for profiles with recent counter updates (cheap query, returns ~hundreds of customer_ids). Phase 2 evaluates only those profiles against all segment conditions. This reduces the evaluation workload by 10-100x.
+
+### Why the agent uses tool calls instead of direct DB access?
+
+The agent could query ClickHouse and Redis directly — it would be faster. But tool calls through the API provide: (1) audit trail — every query is logged, (2) access control — the agent can only see what the API exposes, (3) the same data contract as the UI and external integrations. This is the production-correct pattern for an AI agent layer.
+
+### Why no LangChain?
+
+The tool loop is simple: send messages -> check for tool_use blocks -> execute tools -> send results back. It's ~100 lines. LangChain adds a dependency, abstracts away the mechanics, and makes debugging harder. For learning purposes and for production reliability, the explicit loop is better.
+
 ---
 
 ## Stack
@@ -99,15 +164,20 @@ Sits downstream of the feature store. For a given customer:
 | Feature store        | Redis                                | `features`    |
 | ML scoring           | Python FastAPI service               | `decisions`   |
 | Decision engine      | Thompson Sampling bandit             | `decisions`   |
-| Query API            | FastAPI (17 endpoints)               | `api`         |
+| AI agent             | Anthropic API (tool_use, no frameworks) | `agent`    |
+| Query API            | FastAPI (22 endpoints)               | `api`         |
 | Frontend UI          | React 18 + TypeScript + Tailwind     | `ui`          |
 | Observability        | Prometheus + Grafana                 | `monitoring`  |
-| Infrastructure       | Terraform (kubernetes + helm)        | —             |
-| Kubernetes           | kind                                 | —             |
+| Infrastructure       | Terraform (kubernetes + helm)        | ---           |
+| Kubernetes           | kind                                 | ---           |
 
 ---
 
-## Prerequisites
+## Quick Start
+
+Three scripts control the entire deployment. All Docker image builds, Terraform applies, Kafka topic creation, ClickHouse schema setup, and pipeline data seeding are handled by these scripts — no manual `docker build` or `kubectl` commands needed.
+
+### Prerequisites
 
 ```bash
 brew install kind kubectl terraform
@@ -115,245 +185,225 @@ brew install kind kubectl terraform
 python3 --version  # 3.9+
 ```
 
-## Quick Start
+### Deploy
 
 ```bash
-# 1. Create kind cluster + verify prerequisites
+# 1. Create kind cluster
 ./scripts/setup.sh
 
-# 2. Build images, deploy all infrastructure via Terraform
+# 2. Build all images, deploy infrastructure, apply schemas
 ./scripts/deploy.sh
 
-# 3. Tear down everything when done
+# 3. Seed the pipeline: events → aggregation → features → segments
+./scripts/seed.sh
+
+# 4. Access the API
+kubectl port-forward svc/klaflow-api 8000:80 -n api &
+curl -s http://localhost:8000/segments | python3 -m json.tool
+```
+
+### Teardown
+
+```bash
 ./scripts/teardown.sh
 ```
 
+### Configuration
+
+All service connection strings are defined in `scripts/seed.sh` and the Terraform modules. The single source of truth for each:
+
+| Config | Where defined | Value |
+|--------|--------------|-------|
+| Kafka bootstrap | `scripts/seed.sh`, Terraform env vars | `kafka.streaming.svc.cluster.local:9092` |
+| Schema Registry | `scripts/seed.sh`, Terraform env vars | `http://schema-registry.streaming.svc.cluster.local:8081` |
+| ClickHouse host | `scripts/seed.sh`, Terraform env vars | `clickhouse.analytics.svc.cluster.local` |
+| ClickHouse auth | `scripts/seed.sh`, Terraform env vars | `klaflow` / `klaflow-pass` |
+| Redis host | `scripts/seed.sh`, Terraform env vars | `redis-master.features.svc.cluster.local` |
+| ML scoring URL | `scripts/seed.sh`, Terraform env vars | `http://ml-scoring.decisions.svc.cluster.local:8000` |
+| Anthropic API key | `.env` file (sourced by `deploy.sh`) | `ANTHROPIC_API_KEY=sk-ant-...` |
+
+Python services read these from environment variables with in-cluster defaults, so they work both in k8s (via Terraform-managed env vars) and locally (via port-forwards + exports).
+
+### What the scripts do
+
+**`setup.sh`** — checks prerequisites (docker, kind, kubectl, terraform, python3), creates the `klaflow-us` kind cluster.
+
+**`deploy.sh`** — sources `.env`, builds the 5 service images that Terraform deploys as long-running k8s Deployments (`api`, `ml-models`, `decision-engine`, `agent`, `ui`), loads them into the kind cluster, runs `terraform apply`, waits for Kafka/ClickHouse/Schema Registry, creates the `__consumer_offsets` topic (required for KRaft mode), applies the ClickHouse schema.
+
+**`seed.sh`** — builds the 3 pipeline job images (`producer`, `feature-store`, `segment-worker`), then runs each as a one-off k8s pod in order, waiting for each to complete:
+1. **Producer seed**: 90 days of synthetic events for 18,500 customers across 5 merchants (~5M events)
+2. **Flink aggregation**: real PyFlink jobs (running as FlinkDeployments) consume from Kafka and write fan-out counters to ClickHouse — seed.sh waits 60s for them to process
+3. **Feature writer**: ClickHouse counters -> derived features + ML scores -> Redis + ClickHouse write-back
+4. **Segment evaluation**: SIP two-phase scan + evaluate -> 7 segments populated
+
+**`teardown.sh`** — `terraform destroy` + `kind delete cluster`.
+
 ---
 
-## Running the Pipeline
+## Running the Demo
 
-After `deploy.sh` completes, run the pipeline steps in order:
-
-### Step 1: Seed events into Kafka
+The demo script compares **uniform treatment** (everyone gets 10% discount) vs. **per-customer bandit** (each customer gets the action most likely to convert them).
 
 ```bash
-# Build and load the producer image
-docker build -f docker/producer/Dockerfile -t klaflow-producer . && \
-kind load docker-image klaflow-producer:latest --name klaflow-us
+# Port-forward ClickHouse and Redis for local access
+kubectl port-forward -n analytics svc/clickhouse 8123:8123 &
+kubectl port-forward -n features svc/redis-master 6379:6379 &
 
-# Run seed mode: generates 90 days of events for 18,500 customers across 5 merchants
-kubectl -n processing run producer-seed \
-  --image=klaflow-producer:latest \
-  --image-pull-policy=Never \
-  --restart=Never \
-  --overrides='{
-    "spec":{"containers":[{
-      "name":"producer-seed",
-      "image":"klaflow-producer:latest",
-      "imagePullPolicy":"Never",
-      "env":[
-        {"name":"KAFKA_BOOTSTRAP","value":"kafka.streaming.svc.cluster.local:9092"},
-        {"name":"SCHEMA_REGISTRY_URL","value":"http://schema-registry.streaming.svc.cluster.local:8081"}
-      ],
-      "command":["python","producer.py","--mode","seed"]
-    }]}
-  }'
-
-# Watch progress (~5M events, takes a few minutes)
-kubectl -n processing logs -f producer-seed
+pip3 install numpy redis requests matplotlib
+python3 src/demo/run_demo.py
 ```
 
-### Step 2: Run batch aggregation (fan-out counters)
+### Sample output
 
-```bash
-docker build -f docker/batch_aggregation/Dockerfile -t klaflow-batch-aggregation . && \
-kind load docker-image klaflow-batch-aggregation:latest --name klaflow-us
+```
+=========================================================
+  KLAFLOW DEMO — Per-Customer Decisioning vs. Uniform Treatment
+  Merchant: merchant_001  |  Segment: at_risk  |  Customers: 327
+=========================================================
 
-kubectl -n processing run batch-agg \
-  --image=klaflow-batch-aggregation:latest \
-  --image-pull-policy=Never \
-  --restart=Never \
-  --overrides='{
-    "spec":{"containers":[{
-      "name":"batch-agg",
-      "image":"klaflow-batch-aggregation:latest",
-      "imagePullPolicy":"Never",
-      "env":[
-        {"name":"KAFKA_BOOTSTRAP","value":"kafka.streaming.svc.cluster.local:9092"},
-        {"name":"KAFKA_TOPIC","value":"customer-events"},
-        {"name":"SCHEMA_REGISTRY_URL","value":"http://schema-registry.streaming.svc.cluster.local:8081"},
-        {"name":"CLICKHOUSE_HOST","value":"clickhouse.analytics.svc.cluster.local"},
-        {"name":"CLICKHOUSE_PORT","value":"8123"},
-        {"name":"CLICKHOUSE_USER","value":"klaflow"},
-        {"name":"CLICKHOUSE_PASSWORD","value":"klaflow-pass"}
-      ],
-      "command":["python","batch_aggregation.py"]
-    }]}
-  }'
+  APPROACH A — Uniform (everyone gets 10% discount)
+  -----------------------------------------------------
+  Customers targeted:      327
+  Discounts sent:          327   (100%)
+  Conversions:              22   (6.7%)
+  Revenue attributed:   $    1,387
+  Discount cost:        $      327   ($1/discount)
 
-kubectl -n processing logs -f batch-agg
+  APPROACH B — Per-Customer Bandit (Klaflow)
+  -----------------------------------------------------
+  Customers targeted:      327
+  Arm breakdown:
+    email_no_offer             137   (  42%)  -- engaged, just need a nudge
+    email_free_shipping        124   (  38%)  -- cart abandoners, shipping barrier
+    email_10pct_discount        57   (  17%)  -- price-sensitive
+    sms_nudge                    7   (   2%)  -- don't open email
+    no_send                      2   (   1%)  -- very low intent
+  Conversions:              32   (9.8%)
+  Discount cost:        $      181   (-45% vs A)
+  Revenue attributed:   $    2,029
+
+  DELTA
+  -----------------------------------------------------
+  Conversion rate:    +3.1pp   (+45%)
+  Discount cost:      $    -146    (-45%)
+  Revenue:            $    +642    (+46%)
+=========================================================
 ```
 
-### Step 3: Run feature writer + ML scoring
+### Why the bandit wins
 
-The feature writer reads counters from ClickHouse, computes derived features (open rates,
-lifecycle state), calls the ML scoring service for CLV tier / churn risk / discount sensitivity,
-and writes the results to both **Redis** (for the decision engine) and **ClickHouse** (for
-segment evaluation). This is what populates the ML-dependent segments (`at_risk`, `vip_lapsed`,
-`discount_sensitive`).
+1. **Customers who don't open email** (low `email_open_rate_7d`) never see the discount. The bandit routes these to SMS — a channel that actually reaches them.
+2. **Engaged customers who just need a nudge** (high open rate, prior purchases) would convert without a discount. The bandit sends `email_no_offer`, saving the discount cost.
+3. **Cart abandoners** (high `cart_abandon_rate_30d`) abandoned because of shipping cost, not product price. The bandit sends `email_free_shipping` — addressing the actual barrier.
 
-```bash
-docker build -f docker/feature_store/Dockerfile -t klaflow-feature-store . && \
-kind load docker-image klaflow-feature-store:latest --name klaflow-us
+### How the reward simulation works
 
-kubectl -n processing run feature-writer \
-  --image=klaflow-feature-store:latest \
-  --image-pull-policy=Never \
-  --restart=Never \
-  --overrides='{
-    "spec":{"containers":[{
-      "name":"feature-writer",
-      "image":"klaflow-feature-store:latest",
-      "imagePullPolicy":"Never",
-      "env":[
-        {"name":"CLICKHOUSE_HOST","value":"clickhouse.analytics.svc.cluster.local"},
-        {"name":"CLICKHOUSE_PORT","value":"8123"},
-        {"name":"CLICKHOUSE_USER","value":"klaflow"},
-        {"name":"CLICKHOUSE_PASSWORD","value":"klaflow-pass"},
-        {"name":"REDIS_HOST","value":"redis-master.features.svc.cluster.local"},
-        {"name":"REDIS_PORT","value":"6379"},
-        {"name":"ML_SCORING_URL","value":"http://ml-scoring.decisions.svc.cluster.local:8000"}
-      ],
-      "command":["python","feature_writer.py","--full"]
-    }]}
-  }'
+Each customer gets a deterministic random seed (based on customer_id), so the same customer gets the same random draw regardless of which arm they receive. What changes is the **conversion probability** — which depends on the interaction between the arm and the customer's feature profile. This ensures the comparison is fair: same customers, same randomness, different treatments, different outcomes.
 
-kubectl -n processing logs -f feature-writer
-# Expected: "Found 18248 profiles to update" → "Updated 18248/18248 feature vectors"
+---
+
+## AI Agent
+
+### How it works
+
+The agent is a loop over the Anthropic `messages` API with `tool_use`:
+
+```
+Merchant goal (natural language)
+        |
+   Agent service (Claude + 11 tools)
+        | tool calls
+   Existing FastAPI endpoints
+   (segments, customers, features, bandit)
+        |
+   Scheduled actions per customer
+        |
+   Campaign report (tool call log + arm breakdown)
 ```
 
-What it computes per customer:
+Source: `src/agent/agent.py` (~200 lines, no frameworks)
 
-| Feature | Source | How |
-|---------|--------|-----|
-| `email_open_rate_7d/30d` | ClickHouse counters | opens / (opens + clicks) |
-| `purchase_count_30d` | ClickHouse counters | `purchase_made_30d` |
-| `avg_order_value` | ClickHouse counters | `purchase_amount_30d / purchase_count_30d` |
-| `cart_abandon_rate_30d` | ClickHouse counters | `cart_abandoned_30d` |
-| `lifecycle_state` | Derived | new/active/at_risk/lapsed/churned based on recency |
-| `clv_tier` | ML scoring service | low/medium/high/vip based on purchase value |
-| `churn_risk_score` | ML scoring service | 0.0–1.0 based on inactivity signals |
-| `discount_sensitivity` | ML scoring service | ratio of campaign-attributed purchases |
+### Tool set
 
-The **ML scoring service** (`src/ml_models/score_customers.py`) runs as a FastAPI deployment
-in the `decisions` namespace. It exposes `POST /score` and applies three toy models:
+The LLM can call these 11 functions. Each wraps an existing API endpoint — the agent never touches the database directly.
 
-- **CLV tier**: `purchase_count_30d × avg_order_value` → bracket into low/medium/high/vip
-- **Churn risk**: additive score from days_since_last_purchase, low open rates, no recent purchases
-- **Discount sensitivity**: ratio of purchases that had a campaign_id attached
+| Category | Tool | What it does |
+|----------|------|-------------|
+| Segment | `get_segments()` | List all segments with member counts |
+| Segment | `get_segment_members(segment_name, limit)` | Get customers in a segment |
+| Segment | `get_customer_segments(customer_id)` | Which segments a customer belongs to |
+| Customer | `get_customer_features(customer_id)` | Full feature vector from Redis |
+| Customer | `get_customer_decision_history(customer_id)` | Past decisions + outcomes |
+| Exclusion | `check_recent_contact(customer_id, days)` | Was this customer contacted recently? |
+| Exclusion | `get_suppression_list(account_id)` | Globally suppressed (churned) customers |
+| Decision | `request_decision(customer_id, account_id, context)` | Call the bandit for an arm |
+| Decision | `schedule_action(customer_id, account_id, arm, campaign_id)` | Schedule the action |
+| Measurement | `get_campaign_outcomes(campaign_id)` | Conversion metrics for a campaign |
+| Measurement | `get_arm_performance(arm_name)` | Historical arm stats |
 
-### Step 4: Run segment evaluation
-
-Now that ML-derived metrics (`clv_tier`, `days_since_last_purchase`, `churn_risk_score`,
-`discount_sensitivity`) are written to ClickHouse, segment evaluation can populate all 7 segments.
+### Running the agent
 
 ```bash
-docker build -f docker/segment_worker/Dockerfile -t klaflow-segment-worker . && \
-kind load docker-image klaflow-segment-worker:latest --name klaflow-us
+# Set your Anthropic API key in .env
+echo "ANTHROPIC_API_KEY=sk-ant-..." > .env
 
-kubectl -n processing run segment-eval \
-  --image=klaflow-segment-worker:latest \
-  --image-pull-policy=Never \
-  --restart=Never \
-  --overrides='{
-    "spec":{"containers":[{
-      "name":"segment-eval",
-      "image":"klaflow-segment-worker:latest",
-      "imagePullPolicy":"Never",
-      "env":[
-        {"name":"CLICKHOUSE_HOST","value":"clickhouse.analytics.svc.cluster.local"},
-        {"name":"CLICKHOUSE_PORT","value":"8123"},
-        {"name":"CLICKHOUSE_USER","value":"klaflow"},
-        {"name":"CLICKHOUSE_PASSWORD","value":"klaflow-pass"}
-      ],
-      "command":["python","segment_evaluator.py","--full"]
-    }]}
-  }'
-
-kubectl -n processing logs -f segment-eval
-```
-
-Expected segment distribution after the full pipeline:
-
-| Segment | Members | Description |
-|---------|---------|-------------|
-| `active_browsers` | ~16,000 | page_viewed_7d >= 5 |
-| `high_engagers` | ~8,000 | email_opened_7d >= 3 OR link_clicked_7d >= 2 |
-| `at_risk` | ~6,000 | days_since_last_purchase > 30, no recent purchases |
-| `cart_abandoners` | ~5,000 | cart_abandoned_3d >= 1 |
-| `recent_purchasers` | ~4,000 | purchase_made_7d >= 1 |
-| `vip_lapsed` | ~10 | VIP tier + 60+ days inactive |
-| `discount_sensitive` | 0 | No campaign-attributed purchases in synthetic data |
-
-### Step 5: Query the results
-
-```bash
+# Ensure API is accessible
 kubectl port-forward svc/klaflow-api 8000:80 -n api &
 
-# Segment summary
-curl -s http://localhost:8000/segments | python3 -m json.tool
-
-# Customer features (from Redis)
-curl -s "http://localhost:8000/customers/merchant_001:cust_0001/features?account_id=merchant_001" | python3 -m json.tool
-
-# ML scores
-curl -s "http://localhost:8000/customers/merchant_001:cust_0001/scores?account_id=merchant_001" | python3 -m json.tool
-
-# Account metrics
-curl -s http://localhost:8000/accounts/merchant_001/metrics | python3 -m json.tool
-
-# Bandit decision
-curl -s -X POST http://localhost:8000/decide \
+# Run a campaign via the API
+curl -s -X POST http://localhost:8000/agent/campaign \
   -H "Content-Type: application/json" \
-  -d '{"customer_id":"merchant_001:cust_0001","account_id":"merchant_001"}' | python3 -m json.tool
+  -d '{"account_id":"merchant_001","goal":"Win back at-risk customers. Skip recently contacted."}' \
+  | python3 -m json.tool
+
+# Or via Python directly
+ANTHROPIC_API_KEY=$(grep ANTHROPIC_API_KEY .env | cut -d= -f2) \
+python3 -c "
+import sys; sys.path.insert(0, 'src/agent')
+from agent import run_campaign, campaign_summary
+import json
+c = run_campaign('merchant_001', 'Send a win-back offer to at-risk customers. Skip anyone contacted in the last 14 days.')
+print(json.dumps(campaign_summary(c), indent=2, default=str))
+"
 ```
+
+### Agent API endpoints
+
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/agent/campaign` | POST | Create + execute a campaign from NL goal |
+| `/agent/campaign/{id}` | GET | Campaign status, tool call log, report |
+| `/agent/campaigns` | GET | List all campaigns |
+| `/agent/campaign/{id}/pause` | POST | Pause a running campaign |
+| `/agent/campaign/{id}/cancel` | POST | Cancel a campaign |
+
+### What the LLM does vs. what the tools do
+
+- **LLM**: natural language parsing, deciding which tools to call and in what order, generating the human-readable campaign report
+- **Tools**: all data access, all writes, all arithmetic — the LLM never computes counts, rates, or scores itself
+
+### Goal parser
+
+`src/agent/goal_parser.py` extracts structured metadata from the natural language goal before the LLM loop starts. It identifies: target segments, exclusion windows, VIP handling, and campaign objective (win_back, retention, upsell, cart_recovery). This is used for logging and validation — the LLM handles the actual execution planning.
 
 ---
 
 ## Frontend UI
 
-A React dashboard that connects to the live FastAPI backend. Modeled on Klaviyo's production UI — clean, data-dense, professional SaaS design.
+A React dashboard that connects to the live FastAPI backend.
 
 **Stack:** React 18, TypeScript, Tailwind CSS, React Router v6, TanStack Query, Recharts, Vite.
 
-### Running locally (development)
+### Running locally
 
 ```bash
+# Ensure the API is accessible
+kubectl port-forward svc/klaflow-api 8000:80 -n api &
+
 cd src/ui
 npm install
 npm run dev
-# → http://localhost:3001 (proxies /api to localhost:8000)
-```
-
-Make sure the API port-forward is active:
-
-```bash
-kubectl port-forward svc/klaflow-api 8000:80 -n api &
-```
-
-### Running on Kubernetes
-
-```bash
-# Build and load the UI image
-docker build -f docker/ui/Dockerfile -t klaflow-ui:latest .
-kind load docker-image klaflow-ui:latest --name klaflow-us
-
-# Deploy via Terraform (terraform/modules/ui/)
-cd terraform && terraform apply
-
-# Access via port-forward
-kubectl port-forward svc/klaflow-ui 3000:3000 -n ui &
-open http://localhost:3000
+# -> http://localhost:3001 (proxies /api to localhost:8000)
 ```
 
 ### Pages
@@ -366,8 +416,8 @@ open http://localhost:3000
 | **Segments** | `/segments` | List with member counts, % of total, and human-readable condition summaries. Click through to segment detail. |
 | **Segment Detail** | `/segments/:name` | Condition definition, member count, percentage, and paginated member table with links to customer profiles. |
 | **Decisions** | `/decisions` | Bandit operator view: arm performance table (alpha/beta/expected Thompson), arm distribution pie chart, live decision feed (auto-refreshes every 15s). |
-| **Flows** | `/flows` | Stub — placeholder cards for Welcome Series, Abandoned Cart, Win-Back flows. Phase 2 banner. |
-| **Campaigns** | `/campaigns` | Stub — Phase 2 banner. |
+| **Flows** | `/flows` | Stub — placeholder cards for Welcome Series, Abandoned Cart, Win-Back flows. |
+| **Campaigns** | `/campaigns` | Create campaigns via NL goal, see status, arm breakdown, tool call sequence (terminal-style log), and agent report. |
 
 ### Design
 
@@ -378,263 +428,6 @@ open http://localhost:3000
 - **Loading:** Skeleton screens (shimmer animation), not spinners
 - **Empty states:** Descriptive message, not blank
 - **Errors:** Inline error with retry button
-- **Transitions:** 150ms ease
-
-### API endpoints added for the UI
-
-These endpoints were added to `src/api/main.py` alongside the original 10:
-
-| Endpoint | Method | Description |
-|----------|--------|-------------|
-| `/dashboard/stats` | GET | KPI aggregates: total profiles, active segments, events in last 24h, revenue |
-| `/customers` | GET | Paginated customer list with feature data from Redis. Query params: `page`, `page_size`, `search` |
-| `/customers/{id}/events` | GET | Counter history for a customer from ClickHouse (paginated) |
-| `/customers/{id}/all-segments` | GET | All segment evaluations (both in-segment and not-in-segment) |
-| `/segments/{name}/detail` | GET | Segment metadata: member count, percentage, condition definition |
-| `/decisions/recent` | GET | Recent decisions across all customers for the live feed |
-
-CORS middleware is enabled for frontend development (`allow_origins=["*"]`).
-
----
-
-## Exploring the System
-
-### 1. API — What users see
-
-```bash
-kubectl port-forward svc/klaflow-api 8000:80 -n api &
-```
-
-**Segment queries** (read from ClickHouse `segment_membership`):
-
-```bash
-# All segments with member counts
-curl -s http://localhost:8000/segments | python3 -m json.tool
-
-# Customers in a specific segment
-curl -s "http://localhost:8000/segments/high_engagers/customers?limit=10" | python3 -m json.tool
-
-# Which segments a specific customer belongs to
-curl -s http://localhost:8000/customers/merchant_001:cust_0001/segments | python3 -m json.tool
-```
-
-**Feature store** (read from Redis):
-
-```bash
-# Full feature vector for a customer
-curl -s "http://localhost:8000/customers/merchant_001:cust_0001/features?account_id=merchant_001" | python3 -m json.tool
-
-# ML scores only (CLV tier, churn risk, discount sensitivity)
-curl -s "http://localhost:8000/customers/merchant_001:cust_0001/scores?account_id=merchant_001" | python3 -m json.tool
-```
-
-**Decision engine** (Thompson Sampling bandit):
-
-```bash
-# Get a bandit decision for a customer
-curl -s -X POST http://localhost:8000/decide \
-  -H "Content-Type: application/json" \
-  -d '{"customer_id":"merchant_001:cust_0001","account_id":"merchant_001"}' | python3 -m json.tool
-
-# Past decisions and outcomes
-curl -s "http://localhost:8000/decisions/merchant_001:cust_0001/history" | python3 -m json.tool
-
-# Current arm weights and win rates
-curl -s http://localhost:8000/bandit/arm-stats | python3 -m json.tool
-```
-
-**Account metrics** (read from ClickHouse `account_metrics`):
-
-```bash
-curl -s http://localhost:8000/accounts/merchant_001/metrics | python3 -m json.tool
-```
-
-**Health check:**
-
-```bash
-curl -s http://localhost:8000/health
-```
-
-Source: `src/api/main.py`
-
-### 2. ClickHouse — The query layer
-
-ClickHouse stores **aggregated counters**, not raw events. This is the critical distinction from a naive Kafka-to-ClickHouse pipeline.
-
-```bash
-# Open a ClickHouse client
-kubectl -n analytics exec -it svc/clickhouse -- \
-  clickhouse-client --user klaflow --password klaflow-pass
-```
-
-**Tables** (defined in `src/clickhouse/schema.sql`):
-
-```sql
-SHOW TABLES;
--- customer_counters     ← fan-out counters from aggregation (Track 1)
--- segment_membership    ← segment evaluation results (Track 2)
--- account_metrics       ← per-merchant metrics (Job 2)
--- decision_log          ← bandit decisions
--- reward_log            ← reward closure outcomes
-
--- See what windowed counters look like for a customer
-SELECT metric_name, metric_value
-FROM customer_counters FINAL
-WHERE customer_id = 'merchant_001:cust_0001'
-ORDER BY metric_name;
-
--- Check which metrics exist and how many customers have each
-SELECT metric_name, count() AS customers
-FROM customer_counters FINAL
-GROUP BY metric_name
-ORDER BY customers DESC
-LIMIT 20;
-
--- Segment membership summary
-SELECT segment_name,
-       countIf(in_segment = 1) AS members,
-       count() AS evaluated
-FROM segment_membership FINAL
-GROUP BY segment_name
-ORDER BY members DESC;
-
--- See a customer's segment memberships
-SELECT segment_name, in_segment, evaluated_at
-FROM segment_membership FINAL
-WHERE customer_id = 'merchant_001:cust_0001';
-
--- Account metrics
-SELECT * FROM account_metrics FINAL
-WHERE account_id = 'merchant_001'
-ORDER BY metric_name;
-```
-
-All tables use `ReplacingMergeTree` — duplicate writes are deduplicated by the version column (`computed_at` or `evaluated_at`). Use `FINAL` in queries to get deduplicated results.
-
-### 3. Kafka — Event bus
-
-```bash
-# Exec into a Kafka pod
-kubectl -n streaming exec -it kafka-controller-0 -- bash
-
-# List topics
-/opt/bitnami/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --list
-
-# Check consumer groups and their lag
-/opt/bitnami/kafka/bin/kafka-consumer-groups.sh --bootstrap-server localhost:9092 --list
-/opt/bitnami/kafka/bin/kafka-consumer-groups.sh --bootstrap-server localhost:9092 \
-  --describe --group klaflow-batch-aggregation-v5
-
-# Peek at messages (Ctrl+C to stop) — these are Avro-encoded, not human-readable
-/opt/bitnami/kafka/bin/kafka-console-consumer.sh --bootstrap-server localhost:9092 \
-  --topic customer-events --from-beginning --max-messages 5
-
-# Topic details
-/opt/bitnami/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 \
-  --describe --topic customer-events
-```
-
-**Schema Registry:**
-
-```bash
-kubectl port-forward svc/schema-registry 8081:8081 -n streaming &
-
-# List registered schemas
-curl -s http://localhost:8081/subjects | python3 -m json.tool
-
-# View the Avro schema
-curl -s http://localhost:8081/subjects/customer-events-value/versions/latest | python3 -m json.tool
-```
-
-Source: Avro schema at `src/producer/schemas/customer_event.avsc`
-
-### 4. Redis — Feature store
-
-Pre-computed feature vectors for sub-millisecond reads at decision time. ClickHouse is too slow for per-customer synchronous lookups.
-
-```bash
-# Exec into Redis
-kubectl -n features exec -it svc/redis-master -- redis-cli
-
-# List some customer keys
-KEYS customer:merchant_001:*
-# (shows customer:{account_id}:{customer_id} keys)
-
-# View a customer's full feature vector
-HGETALL customer:merchant_001:merchant_001:cust_0001
-
-# Check specific fields
-HGET customer:merchant_001:merchant_001:cust_0001 clv_tier
-HGET customer:merchant_001:merchant_001:cust_0001 churn_risk_score
-
-# Count total feature vectors
-DBSIZE
-
-# Check TTL (features expire after 48 hours)
-TTL customer:merchant_001:merchant_001:cust_0001
-```
-
-Feature vector fields (see `src/feature_store/feature_schema.py`):
-
-| Field | Type | Description |
-|-------|------|-------------|
-| `email_open_rate_7d` | float | opens / sends in last 7d |
-| `email_open_rate_30d` | float | opens / sends in last 30d |
-| `purchase_count_30d` | int | purchases in last 30d |
-| `days_since_last_purchase` | int | days since last purchase (999 = never) |
-| `avg_order_value` | float | average order value |
-| `cart_abandon_rate_30d` | float | cart abandonment rate |
-| `preferred_send_hour` | int | 0-23, learned from open timestamps |
-| `lifecycle_state` | string | new, active, at_risk, lapsed, churned |
-| `clv_tier` | string | low, medium, high, vip |
-| `churn_risk_score` | float | 0.0–1.0 |
-| `discount_sensitivity` | float | 0.0–1.0 |
-| `updated_at` | epoch_ms | last update timestamp |
-
-### 5. Prometheus + Grafana
-
-```bash
-# Grafana (login: admin / klaflow)
-kubectl port-forward svc/kube-prometheus-stack-grafana 3000:80 -n monitoring &
-open http://localhost:3000
-
-# Prometheus
-kubectl port-forward svc/kube-prometheus-stack-prometheus 9090:9090 -n monitoring &
-open http://localhost:9090
-```
-
-Useful Prometheus queries:
-- `up` — which targets are being scraped
-- `container_memory_usage_bytes{namespace="analytics"}` — ClickHouse memory
-- `container_memory_usage_bytes{namespace="streaming"}` — Kafka memory
-- `rate(container_cpu_usage_seconds_total{namespace="processing"}[5m])` — processing CPU
-
-### 6. Terraform — Infrastructure
-
-```bash
-cd terraform
-
-# See what Terraform manages
-terraform state list
-
-# Inspect a specific resource
-terraform state show module.kafka.helm_release.kafka
-terraform state show module.clickhouse.helm_release.clickhouse
-
-# See what would change
-terraform plan
-```
-
-Module dependency graph:
-```
-kafka (streaming)
-clickhouse (analytics)        ──► decisions (depends on clickhouse + redis)
-redis (features)              ──► api (depends on clickhouse + redis)
-flink (processing)                  ──► ui (standalone, proxies to api)
-observability (monitoring)
-```
-
-Source: `terraform/main.tf` and `terraform/modules/*/main.tf`
 
 ---
 
@@ -670,6 +463,8 @@ Every event entering Kafka is validated against `src/producer/schemas/customer_e
 | `account_metrics` | ReplacingMergeTree | Flink Job 2 / batch agg | Per-merchant aggregate metrics |
 | `decision_log` | MergeTree | Decision engine | Every bandit decision made |
 | `reward_log` | MergeTree | Reward closure job | Observed outcomes for decisions |
+
+All tables use `ReplacingMergeTree` — duplicate writes are deduplicated by the version column (`computed_at` or `evaluated_at`). Use `FINAL` in queries to get deduplicated results.
 
 ### Segments
 
@@ -707,9 +502,102 @@ Reward signal: +1.0 purchase within 72h, +0.1 email opened, -0.5 unsubscribed, 0
 | merchant_004 | 10,000 | Large |
 | merchant_005 | 2,000 | Mid-market |
 
-Event rates per customer per day (Poisson): page_viewed (λ=3), email_opened (λ=0.4), cart_abandoned (λ=0.15), link_clicked (λ=0.1), purchase_made (λ=0.05).
+Event rates per customer per day (Poisson): page_viewed (l=3), email_opened (l=0.4), cart_abandoned (l=0.15), link_clicked (l=0.1), purchase_made (l=0.05).
 
-Customer lifecycle: `new → active → at_risk → lapsed → churned` with weekly transition probabilities. Lifecycle state affects event generation rates (churned customers produce ~0 events).
+Customer lifecycle: `new -> active -> at_risk -> lapsed -> churned` with weekly transition probabilities. Lifecycle state affects event generation rates (churned customers produce ~0 events).
+
+### Feature Vector (Redis)
+
+Pre-computed per customer, stored as a Redis hash at `customer:{account_id}:{customer_id}`:
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `email_open_rate_7d` | float | opens / sends in last 7d |
+| `email_open_rate_30d` | float | opens / sends in last 30d |
+| `purchase_count_30d` | int | purchases in last 30d |
+| `days_since_last_purchase` | int | days since last purchase (999 = never) |
+| `avg_order_value` | float | average order value |
+| `cart_abandon_rate_30d` | float | cart abandonment rate |
+| `preferred_send_hour` | int | 0-23, learned from open timestamps |
+| `lifecycle_state` | string | new, active, at_risk, lapsed, churned |
+| `clv_tier` | string | low, medium, high, vip |
+| `churn_risk_score` | float | 0.0-1.0 |
+| `discount_sensitivity` | float | 0.0-1.0 |
+| `updated_at` | epoch_ms | last update timestamp |
+
+---
+
+## Inspecting Internals
+
+These commands are for debugging and exploring the system after deployment. They are not required for normal operation.
+
+### API
+
+```bash
+kubectl port-forward svc/klaflow-api 8000:80 -n api &
+
+curl -s http://localhost:8000/segments | python3 -m json.tool
+curl -s "http://localhost:8000/segments/high_engagers/customers?limit=10" | python3 -m json.tool
+curl -s http://localhost:8000/customers/merchant_001:cust_0001/segments | python3 -m json.tool
+curl -s "http://localhost:8000/customers/merchant_001:cust_0001/features?account_id=merchant_001" | python3 -m json.tool
+curl -s -X POST http://localhost:8000/decide \
+  -H "Content-Type: application/json" \
+  -d '{"customer_id":"merchant_001:cust_0001","account_id":"merchant_001"}' | python3 -m json.tool
+```
+
+### ClickHouse
+
+```bash
+kubectl -n analytics exec -it svc/clickhouse -- \
+  clickhouse-client --user klaflow --password klaflow-pass
+
+-- Fan-out counters for a customer
+SELECT metric_name, metric_value
+FROM customer_counters FINAL
+WHERE customer_id = 'merchant_001:cust_0001'
+ORDER BY metric_name;
+
+-- Segment membership summary
+SELECT segment_name,
+       countIf(in_segment = 1) AS members,
+       count() AS evaluated
+FROM segment_membership FINAL
+GROUP BY segment_name
+ORDER BY members DESC;
+```
+
+### Kafka
+
+```bash
+kubectl -n streaming exec -it kafka-controller-0 -- bash
+
+/opt/bitnami/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --list
+/opt/bitnami/kafka/bin/kafka-consumer-groups.sh --bootstrap-server localhost:9092 --list
+```
+
+### Redis
+
+```bash
+kubectl -n features exec -it svc/redis-master -- redis-cli
+
+HGETALL customer:merchant_001:merchant_001:cust_0001
+DBSIZE
+```
+
+### Prometheus + Grafana
+
+```bash
+kubectl port-forward svc/kube-prometheus-stack-grafana 3000:80 -n monitoring &
+# Login: admin / klaflow
+```
+
+### Terraform
+
+```bash
+cd terraform
+terraform state list
+terraform plan
+```
 
 ---
 
@@ -718,7 +606,7 @@ Customer lifecycle: `new → active → at_risk → lapsed → churned` with wee
 ```
 klaflow/
 ├── terraform/
-│   ├── providers.tf                        # K8s + Helm providers → kind-klaflow-us
+│   ├── providers.tf                        # K8s + Helm providers -> kind-klaflow-us
 │   ├── main.tf                             # Wires all modules together
 │   └── modules/
 │       ├── kafka/                           # Kafka + Schema Registry
@@ -728,7 +616,8 @@ klaflow/
 │       ├── observability/                   # Prometheus + Grafana
 │       ├── decisions/                       # ML scoring + reward logger
 │       ├── api/                             # FastAPI deployment
-│       └── ui/                              # React frontend (Deployment + Service)
+│       ├── ui/                              # React frontend (Deployment + Service)
+│       └── agent/                           # AI agent service (Phase 2a)
 ├── src/
 │   ├── producer/
 │   │   ├── producer.py                      # Synthetic events: seed (90 days) or continuous
@@ -736,11 +625,11 @@ klaflow/
 │   ├── flink_jobs/
 │   │   ├── customer_aggregation_job.py      # Job 1: per-customer fan-out counters (PyFlink)
 │   │   ├── account_aggregation_job.py       # Job 2: per-account metrics (PyFlink)
-│   │   └── batch_aggregation.py             # Batch variant (confluent_kafka, no Flink)
+│   │   └── requirements.txt
 │   ├── segment_worker/
-│   │   └── segment_evaluator.py             # SIP two-phase: scan changed → evaluate rules
+│   │   └── segment_evaluator.py             # SIP two-phase: scan changed -> evaluate rules
 │   ├── feature_store/
-│   │   ├── feature_writer.py                # ClickHouse → compute features → Redis
+│   │   ├── feature_writer.py                # ClickHouse -> compute features -> Redis
 │   │   └── feature_schema.py                # CustomerFeatureVector dataclass
 │   ├── ml_models/
 │   │   └── score_customers.py               # CLV tier, churn risk, discount sensitivity
@@ -749,7 +638,17 @@ klaflow/
 │   │   ├── arms.py                          # 5 arms + reward constants
 │   │   └── reward_logger.py                 # Background reward closure job
 │   ├── api/
-│   │   └── main.py                          # 17 FastAPI endpoints (10 original + 7 UI)
+│   │   ├── main.py                          # 17 original + 5 agent endpoints
+│   │   └── agent_endpoints.py               # /agent/* campaign CRUD routes
+│   ├── agent/                               # Phase 2a: AI marketing agent
+│   │   ├── agent.py                         # LLM orchestration loop (Anthropic tool_use)
+│   │   ├── tools.py                         # 11 tool wrappers over FastAPI
+│   │   ├── tool_schemas.py                  # JSON schemas for each tool
+│   │   ├── goal_parser.py                   # NL -> structured CampaignIntent
+│   │   ├── campaign_monitor.py              # Outcome metrics + report formatting
+│   │   └── requirements.txt                 # anthropic + httpx
+│   ├── demo/
+│   │   └── run_demo.py                      # Side-by-side comparison script
 │   ├── ui/                                  # React frontend
 │   │   ├── src/
 │   │   │   ├── api/client.ts                # TanStack Query API client
@@ -766,7 +665,8 @@ klaflow/
 ├── docker/                                  # Dockerfiles for each service
 ├── scripts/
 │   ├── setup.sh                             # Prerequisites + kind cluster creation
-│   ├── deploy.sh                            # Build images + terraform apply
+│   ├── deploy.sh                            # Build all images + terraform apply + schema setup
+│   ├── seed.sh                              # Run pipeline steps in order (events -> counters -> features -> segments)
 │   └── teardown.sh                          # Terraform destroy + kind delete
 └── tests/                                   # 170 pytest tests across all layers
 ```
@@ -783,28 +683,39 @@ Tests mock external dependencies (Kafka, ClickHouse, Redis, PyFlink) and validat
 ## Data Flow (End-to-End)
 
 ```
-1. Producer generates synthetic customer events (Avro-validated via Schema Registry)
-2. Events land in Kafka topic: customer-events
-3. Batch aggregation (or Flink Job 1) reads events, computes windowed fan-out counters
-     1 event → N counters (event_type x window x campaign x category)
-     Only windows the event falls within are updated (7-day-old event → 30d only, not 7d)
-4. Counters written to ClickHouse customer_counters table
-5. Feature writer reads counters from ClickHouse, computes derived features
-     (open rates, lifecycle state), calls ML scoring service (CLV tier, churn risk,
-     discount sensitivity), writes feature vectors to Redis (48h TTL) AND writes
-     ML-derived metrics back to ClickHouse (so segments can query them)
-6. Segment evaluator scans for recently updated profiles (Phase 1)
-     Then evaluates 7 segment conditions against windowed counters + ML metrics (Phase 2)
-     Results written to ClickHouse segment_membership table
-7. Decision engine reads feature vector from Redis, scores 5 arms,
-     applies Thompson Sampling, logs decision to ClickHouse
-8. Reward closure job checks outcomes (purchases within 72h), writes to reward_log
-9. API serves queries over all of the above — segments, features, decisions, metrics
+ 1. Producer generates synthetic customer events (Avro-validated via Schema Registry)
+ 2. Events land in Kafka topic: customer-events
+ 3. Batch aggregation (or Flink Job 1) reads events, computes windowed fan-out counters
+      1 event -> N counters (event_type x window x campaign x category)
+      Only windows the event falls within are updated (7-day-old event -> 30d only, not 7d)
+ 4. Counters written to ClickHouse customer_counters table
+ 5. Feature writer reads counters from ClickHouse, computes derived features
+      (open rates, lifecycle state), calls ML scoring service (CLV tier, churn risk,
+      discount sensitivity), writes feature vectors to Redis (48h TTL) AND writes
+      ML-derived metrics back to ClickHouse (so segments can query them)
+ 6. Segment evaluator scans for recently updated profiles (Phase 1)
+      Then evaluates 7 segment conditions against windowed counters + ML metrics (Phase 2)
+      Results written to ClickHouse segment_membership table
+ 7. Decision engine reads feature vector from Redis, scores 5 arms,
+      applies Thompson Sampling, logs decision to ClickHouse
+ 8. Reward closure job checks outcomes (purchases within 72h), writes to reward_log
+ 9. API serves queries over all of the above — segments, features, decisions, metrics
 10. React UI connects to the API and presents dashboards, profile views,
-      segment management, and a bandit operator console
+      segment management, campaigns, and a bandit operator console
+11. AI agent receives NL goal -> calls tools (segments, features, bandit) ->
+      schedules per-customer actions -> generates campaign report with tool call log
 ```
 
 The key ordering dependency: **feature writer must run before segment evaluation** for ML-dependent
 segments (`at_risk`, `vip_lapsed`, `discount_sensitive`) to have non-zero members. The feature
 writer writes `clv_tier`, `days_since_last_purchase`, `churn_risk_score`, and `discount_sensitivity`
 back to `customer_counters` in ClickHouse, which the segment evaluator then queries.
+
+## Project Phases
+
+| Phase | Status | What it adds |
+|-------|--------|-------------|
+| **Phase 1** | Complete | Core pipeline: Kafka -> aggregation -> ClickHouse -> segments -> Redis -> bandit -> API -> UI |
+| **Phase 2a** | Complete | AI agent: NL goals -> tool calls -> bandit decisions -> campaign reports |
+| **Phase 2b** | Not started | Ontology layer: Neo4j knowledge graph for multi-hop reasoning |
+| **Phase 3** | Not started | Multi-region: two kind clusters, MirrorMaker, segment divergence detection |

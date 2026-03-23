@@ -22,5 +22,11 @@ __pycache__/
 src/ui/node_modules/
 src/ui/dist/
 
+# Secrets
+.env
+
+# Demo output
+demo_output/
+
 # OS
 .DS_Store

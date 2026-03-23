@@ -37,7 +37,7 @@ export default function Layout() {
           ))}
         </nav>
         <div className="px-5 py-4 border-t border-white/10">
-          <p className="text-gray-500 text-xs">Phase 1 — Single Region</p>
+          <p className="text-gray-500 text-xs">Phase 2a — AI Agent</p>
         </div>
       </aside>
 

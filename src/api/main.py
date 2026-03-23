@@ -421,6 +421,17 @@ def recent_decisions(limit: int = Query(20, ge=1, le=100)):
     return rows
 
 
+# ---------------------------------------------------------------------------
+# Phase 2a: Agent campaign endpoints
+# ---------------------------------------------------------------------------
+
+try:
+    from agent_endpoints import router as agent_router
+    app.include_router(agent_router)
+except ImportError:
+    pass  # Agent module not available in this deployment
+
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)

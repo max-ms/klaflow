@@ -4,12 +4,14 @@ Emulates Klaviyo's event ingestion for 5 merchant accounts with 18,500 total
 customers. Includes a lifecycle state machine that drives realistic behavioral
 clusters (active customers generate many events, churned ones generate ~0).
 
-Two modes:
+Three modes:
   python producer.py --mode seed        Generate 90 days of historical events
   python producer.py --mode continuous  Emit events indefinitely at --rate/sec
+  python producer.py --mode single      Inject one event and print trace commands
 """
 
 import argparse
+import json
 import math
 import os
 import random
@@ -412,19 +414,108 @@ def run_continuous(args):
 
 
 # ---------------------------------------------------------------------------
+# Single-event mode
+# ---------------------------------------------------------------------------
+
+def run_single(args):
+    """Inject a single event into Kafka and print commands to trace it through the pipeline."""
+    producer, avro_serializer, string_serializer = make_producer()
+    customer_id = args.customer_id
+    event_type = args.event_type
+
+    if ":" in customer_id:
+        account_id = customer_id.rsplit(":", 1)[0]
+    else:
+        account_id = "merchant_001"
+
+    print("=== SINGLE EVENT MODE ===")
+    print(f"Customer: {customer_id}, Event: {event_type}")
+    print(f"Kafka: {KAFKA_BOOTSTRAP}, Schema Registry: {SCHEMA_REGISTRY_URL}")
+
+    event = generate_event(
+        customer_id=customer_id,
+        account_id=account_id,
+        event_type=event_type,
+    )
+    if args.amount is not None:
+        event["properties"]["amount"] = args.amount
+    if args.campaign_id is not None:
+        event["properties"]["campaign_id"] = args.campaign_id
+
+    print()
+    print(json.dumps(event, indent=2, default=str))
+    print()
+
+    try:
+        produce_event(producer, avro_serializer, string_serializer, event)
+    except BufferError:
+        producer.poll(1)
+        produce_event(producer, avro_serializer, string_serializer, event)
+
+    producer.poll(0)
+    producer.flush(timeout=10)
+
+    print("=== EVENT PRODUCED ===")
+    print()
+    print("Trace the event through the pipeline:")
+    print()
+    print(f"1. CLICKHOUSE CUSTOMER COUNTERS (Flink Job 1):")
+    print(f"   kubectl exec -n analytics clickhouse-0 -- clickhouse-client \\")
+    print(f"     --user klaflow --password klaflow-pass \\")
+    print(f"     --query \"SELECT * FROM customer_counters \\")
+    print(f"              WHERE customer_id = '{customer_id}' \\")
+    print(f"              ORDER BY computed_at DESC LIMIT 10\"")
+    print()
+    print(f"2. CLICKHOUSE ACCOUNT METRICS (Flink Job 2):")
+    print(f"   kubectl exec -n analytics clickhouse-0 -- clickhouse-client \\")
+    print(f"     --user klaflow --password klaflow-pass \\")
+    print(f"     --query \"SELECT * FROM account_metrics \\")
+    print(f"              WHERE account_id = '{account_id}' \\")
+    print(f"              ORDER BY computed_at DESC LIMIT 5\"")
+    print()
+    print(f"3. SEGMENT MEMBERSHIP (segment evaluator):")
+    print(f"   kubectl exec -n analytics clickhouse-0 -- clickhouse-client \\")
+    print(f"     --user klaflow --password klaflow-pass \\")
+    print(f"     --query \"SELECT * FROM segment_membership \\")
+    print(f"              WHERE customer_id = '{customer_id}' \\")
+    print(f"              ORDER BY evaluated_at DESC\"")
+    print()
+    print(f"4. REDIS FEATURE VECTOR (feature writer):")
+    print(f"   kubectl exec -n features deploy/redis-master -- \\")
+    print(f"     redis-cli HGETALL \"customer:{account_id}:{customer_id}\"")
+    print()
+    print(f"5. DECISION ENGINE:")
+    print(f"   curl -X POST http://localhost:8000/decide \\")
+    print(f"     -H 'Content-Type: application/json' \\")
+    print(f"     -d '{{\"customer_id\": \"{customer_id}\", \"account_id\": \"{account_id}\", \"context\": \"{event_type}\"}}'")
+    print()
+
+
+# ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 
 def main():
     parser = argparse.ArgumentParser(description="Klaflow event producer")
-    parser.add_argument("--mode", choices=["seed", "continuous"], default="continuous",
-                        help="seed: 90-day backfill; continuous: real-time stream")
+    parser.add_argument("--mode", choices=["seed", "continuous", "single"], default="continuous",
+                        help="seed: 90-day backfill; continuous: real-time stream; single: inject one event")
     parser.add_argument("--rate", type=int, default=10,
                         help="Events per second (continuous mode only)")
+    parser.add_argument("--customer-id", default="merchant_001:cust_0042",
+                        help="Customer ID (single mode, default: merchant_001:cust_0042)")
+    parser.add_argument("--event-type", default="purchase_made",
+                        choices=EVENT_TYPES,
+                        help="Event type (single mode, default: purchase_made)")
+    parser.add_argument("--amount", type=float, default=None,
+                        help="Purchase amount (single mode, purchase_made/cart_abandoned)")
+    parser.add_argument("--campaign-id", default=None,
+                        help="Campaign ID (single mode, email/link events)")
     args = parser.parse_args()
 
     if args.mode == "seed":
         run_seed(args)
+    elif args.mode == "single":
+        run_single(args)
     else:
         run_continuous(args)
 
