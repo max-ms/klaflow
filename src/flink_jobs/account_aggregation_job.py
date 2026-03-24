@@ -252,7 +252,7 @@ def main():
             'topic' = '{KAFKA_TOPIC}',
             'properties.bootstrap.servers' = '{KAFKA_BOOTSTRAP}',
             'properties.group.id' = 'klaflow-account-aggregation',
-            'scan.startup.mode' = 'earliest-offset',
+            'scan.startup.mode' = 'group-offsets',
             'format' = 'raw'
         )
     """)

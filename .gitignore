@@ -28,5 +28,8 @@ src/ui/dist/
 # Demo output
 demo_output/
 
+# Shopify webhook raw payloads
+data/shopify_webhooks/
+
 # OS
 .DS_Store
