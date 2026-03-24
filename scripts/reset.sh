@@ -18,10 +18,24 @@ for job in customer-aggregation account-aggregation; do
 done
 echo "  Flink jobs suspended."
 
-# ---------- Step 2: Reset Kafka consumer group offsets to end ----------
+# ---------- Step 2: Purge Kafka topic and reset consumer offsets ----------
+echo ""
+echo "--- Purging Kafka topic ---"
+KAFKA_POD=$(kubectl get pod -n streaming -l app.kubernetes.io/name=kafka -o jsonpath='{.items[0].metadata.name}')
+
+# Delete and recreate the topic to purge all old messages
+echo "  Deleting customer-events topic..."
+kubectl exec -n streaming "$KAFKA_POD" -c kafka -- /opt/bitnami/kafka/bin/kafka-topics.sh \
+    --bootstrap-server localhost:9092 --delete --topic customer-events 2>/dev/null || true
+sleep 2
+echo "  Recreating customer-events topic..."
+kubectl exec -n streaming "$KAFKA_POD" -c kafka -- /opt/bitnami/kafka/bin/kafka-topics.sh \
+    --bootstrap-server localhost:9092 --create --topic customer-events \
+    --partitions 3 --replication-factor 1 2>/dev/null || true
+echo "  Topic purged."
+
 echo ""
 echo "--- Resetting Kafka consumer offsets ---"
-KAFKA_POD=$(kubectl get pod -n streaming -l app.kubernetes.io/name=kafka -o jsonpath='{.items[0].metadata.name}')
 for group in klaflow-customer-aggregation klaflow-account-aggregation; do
     echo "  Resetting $group to latest offset..."
     kubectl exec -n streaming "$KAFKA_POD" -c kafka -- /opt/bitnami/kafka/bin/kafka-consumer-groups.sh \
